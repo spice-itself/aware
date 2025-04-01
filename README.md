@@ -12,3 +12,7 @@ Clone this repo and run `cargo build`
 To supervise a program: `./aware supervise /path/to/program [arg1 arg2 ...]`
 To stop a specific supervised program: `./aware leave program_name`
 To stop all supervised programs: `./aware leave`
+
+### For Arch users
+It's available in AUR.
+Package name: `aware`
