@@ -1,7 +1,9 @@
 [package]
-name = "aware"
-version = "0.1.4"
-edition = "2024"
+name = "aware_supervisor" # Можете назвать как угодно
+version = "0.1.0"
+edition = "2021"
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
+chrono = "0.4"
+nix = "0.27"
+signal-hook = "0.3"
