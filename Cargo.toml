@@ -1,9 +1,9 @@
 [package]
-name = "aware_supervisor" # Можете назвать как угодно
+name = "aware_supervisor"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 chrono = "0.4"
-nix = "0.27"
+nix = { version = "0.27", features = ["signal", "process"] }
 signal-hook = "0.3"
