@@ -6,6 +6,7 @@ use nix::{
 };
 use signal_hook::{consts::SIGTERM, flag as signal_flag};
 use std::{
+    // Добавляем env обратно, так как main будет восстановлена
     env,
     fs::{self, File, OpenOptions},
     // Убираем неиспользуемый Read
@@ -20,16 +21,136 @@ use std::{
     time::Duration,
 };
 
-// ... (остальная часть кода ProcessInfo, main, print_usage, write_pid_file, cleanup_pid_file) ...
-// КОД ДО run_supervisor ОСТАЕТСЯ БЕЗ ИЗМЕНЕНИЙ ОТ ПРЕДЫДУЩЕЙ ВЕРСИИ
+// --- ВОССТАНАВЛИВАЕМ ОПРЕДЕЛЕНИЕ ProcessInfo ---
+struct ProcessInfo {
+    name: String,          // Полный путь или имя программы
+    program_name: String,  // Имя файла программы (для имен файлов)
+    args: Vec<String>,
+    log_path: PathBuf,     // Используем PathBuf для путей
+    pid_path: PathBuf,
+}
+// -----------------------------------------------
 
-// Вставляем функции send_leave_signal и read_pid_from_file без изменений от предыдущей версии
-// ...
+// --- ВОССТАНАВЛИВАЕМ main ---
+fn main() -> io::Result<()> {
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() < 2 {
+        print_usage();
+        return Ok(());
+    }
+
+    // Создаем директории заранее, если их нет
+    fs::create_dir_all("aware_logs")?;
+    fs::create_dir_all("aware_pids")?;
+
+    match args[1].as_str() {
+        "supervise" => {
+            if args.len() < 3 {
+                eprintln!("Ошибка: Укажите программу для запуска."); // Пишем ошибки в stderr
+                print_usage();
+                return Ok(());
+            }
+
+            let program_path_str = &args[2];
+            let program_path = Path::new(program_path_str);
+
+            // Получаем имя программы из пути
+            let program_name = program_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| program_path_str.to_string()); // Запасной вариант, если имя извлечь не удалось
+
+            // Пути к лог-файлу и PID-файлу
+            let log_path = PathBuf::from(format!("aware_logs/{}.log", program_name));
+            let pid_path = PathBuf::from(format!("aware_pids/{}.pid", program_name));
+
+            // Информация о процессе
+            let process_info = ProcessInfo {
+                name: program_path_str.clone(),
+                program_name: program_name.clone(), // Сохраняем чистое имя
+                args: args[3..].to_vec(),
+                log_path,
+                pid_path: pid_path.clone(), // Клонируем для передачи
+            };
+
+            // Записываем PID-файл (с PID текущего супервизора)
+            // Передаем &pid_path вместо строки
+            write_pid_file(&pid_path, &process_info.program_name)?;
+
+            // Запускаем супервизор
+            // Используем expect для критических ошибок
+            run_supervisor(process_info).expect("Не удалось запустить супервизор");
+        }
+        "leave" => {
+            if args.len() >= 3 {
+                // Остановка конкретной программы
+                send_leave_signal(Some(&args[2]))?;
+            } else {
+                // Остановка всех программ
+                send_leave_signal(None)?;
+            }
+        }
+        _ => {
+            eprintln!("Неизвестная команда: {}", args[1]);
+            eprintln!("Поддерживаемые команды: supervise, leave");
+        }
+    }
+
+    Ok(())
+}
+// -----------------------------
+
+// --- ВОССТАНАВЛИВАЕМ print_usage ---
+fn print_usage() {
+    println!(
+        "Использование:\n  aware supervise <программа> [аргументы...]\n  aware leave [имя_программы]"
+    );
+}
+// ------------------------------------
+
+// -- Управление PID-файлами --
+
+// Записывает PID текущего процесса (супервизора) в файл
+fn write_pid_file(pid_path: &Path, program_name: &str) -> io::Result<()> {
+    // Записываем PID текущего процесса
+    let pid = std::process::id();
+    fs::write(pid_path, pid.to_string())?; // fs::write проще для записи строки
+
+    // Добавляем запись в общий список процессов (опционально, но полезно для leave all)
+    let list_path = PathBuf::from("aware_pids/processes.list");
+    let mut list_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(list_path)?;
+    // Храним путь к pid файлу для простоты поиска при leave all
+    writeln!(list_file, "{}:{}", program_name, pid_path.display())?;
+
+    Ok(())
+}
+
+// --- ВОССТАНАВЛИВАЕМ cleanup_pid_file ---
+// Удаляет PID-файл и запись из списка (если нужно)
+fn cleanup_pid_file(pid_path: &Path, program_name: &str) -> io::Result<()> {
+    if pid_path.exists() {
+        fs::remove_file(pid_path)?;
+        println!("PID-файл удален: {}", pid_path.display()); // Добавим лог
+    }
+
+    // Очистка из списка (более сложная, требует чтения и перезаписи)
+    // TODO: Реализовать очистку processes.list при необходимости
+    let _ = program_name; // Убираем warning о неиспользуемой переменной
+
+    Ok(())
+}
+// ----------------------------------------
 
 // -- Отправка сигнала для остановки --
 
 fn send_leave_signal(program_name: Option<&str>) -> io::Result<()> {
-    let pids_to_signal: Vec<(String, u32)> = Vec::new(); // Собираем PIDы для отправки сигналов
+    // --- УДАЛЯЕМ НЕИСПОЛЬЗУЕМУЮ ПЕРЕМЕННУЮ ---
+    // let pids_to_signal: Vec<(String, u32)> = Vec::new();
+    // ----------------------------------------
 
     if let Some(name) = program_name {
         // Сигнал конкретному процессу
@@ -39,7 +160,7 @@ fn send_leave_signal(program_name: Option<&str>) -> io::Result<()> {
             Ok(pid) => {
                 println!("Отправка SIGTERM процессу {} (PID: {})", name, pid);
                 // Отправляем сигнал SIGTERM
-                match kill(Pid::from_raw(pid as i32), Some(Signal::SIGTERM)) { // Теперь должно работать
+                match kill(Pid::from_raw(pid as i32), Some(Signal::SIGTERM)) {
                     Ok(_) => println!("Сигнал отправлен успешно."),
                     Err(e) => eprintln!("Ошибка отправки сигнала процессу {}: {}", pid, e),
                 }
@@ -74,7 +195,7 @@ fn send_leave_signal(program_name: Option<&str>) -> io::Result<()> {
                              match read_pid_from_file(&path) {
                                  Ok(pid) => {
                                      println!("Отправка SIGTERM процессу {} (PID: {})", name, pid);
-                                     match kill(Pid::from_raw(pid as i32), Some(Signal::SIGTERM)) { // Теперь должно работать
+                                     match kill(Pid::from_raw(pid as i32), Some(Signal::SIGTERM)) {
                                          Ok(_) => {} // Успешно
                                          Err(e) => eprintln!("Ошибка отправки сигнала процессу {}: {}", pid, e),
                                      }
@@ -94,6 +215,7 @@ fn send_leave_signal(program_name: Option<&str>) -> io::Result<()> {
     Ok(())
 }
 
+// --- ВОССТАНАВЛИВАЕМ read_pid_from_file ---
 fn read_pid_from_file(pid_path: &Path) -> io::Result<u32> {
     let pid_str = fs::read_to_string(pid_path)?;
     pid_str
@@ -101,10 +223,11 @@ fn read_pid_from_file(pid_path: &Path) -> io::Result<u32> {
         .parse::<u32>()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Ошибка парсинга PID: {}", e)))
 }
-
+// ----------------------------------------
 
 // -- Основной цикл супервизора --
 
+// --- Используем ProcessInfo ---
 fn run_supervisor(info: ProcessInfo) -> io::Result<()> {
     println!(
         "Запуск супервизора для программы: {}",
@@ -219,6 +342,7 @@ fn run_supervisor(info: ProcessInfo) -> io::Result<()> {
     write_log(&log_file, "Супервизор завершает работу.")?;
 
     // Очистка PID-файла при завершении
+    // --- Используем cleanup_pid_file ---
     cleanup_pid_file(&info.pid_path, &info.program_name)
         .map_err(|e| eprintln!("Ошибка при очистке PID-файла: {}", e))
         .ok(); // Игнорируем ошибку очистки, если она произошла
@@ -226,10 +350,9 @@ fn run_supervisor(info: ProcessInfo) -> io::Result<()> {
     Ok(())
 }
 
-// ... (Функции start_process и write_log остаются без изменений от предыдущей версии) ...
-
 // -- Запуск дочернего процесса и логирование его вывода --
 
+// --- Используем &ProcessInfo ---
 fn start_process(
     info: &ProcessInfo,
     log_file_arc: &Arc<Mutex<File>>,
