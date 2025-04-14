@@ -1,44 +1,33 @@
-use std::env;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use chrono::Local;
+use nix::{
+    sys::signal::{kill, Signal},
+    unistd::Pid,
+};
+use signal_hook::{consts::SIGTERM, flag as signal_flag};
+use std::{
+    env,
+    fs::{self, File, OpenOptions},
+    io::{self, BufRead, BufReader, Read, Write},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
-enum SupervisorCommand {
-    Leave,
-}
-
+// Структура информации о процессе осталась прежней
 struct ProcessInfo {
-    name: String,
+    name: String,          // Полный путь или имя программы
+    program_name: String,  // Имя файла программы (для имен файлов)
     args: Vec<String>,
-    log_path: String,
+    log_path: PathBuf,     // Используем PathBuf для путей
+    pid_path: PathBuf,
 }
 
-struct CommandChannel {
-    command: Mutex<Option<SupervisorCommand>>,
-}
-
-impl CommandChannel {
-    fn new() -> Self {
-        CommandChannel {
-            command: Mutex::new(None),
-        }
-    }
-
-    fn put_command(&self, cmd: SupervisorCommand) {
-        let mut command = self.command.lock().unwrap();
-        *command = Some(cmd);
-    }
-
-    fn get_command(&self) -> Option<SupervisorCommand> {
-        let mut command = self.command.lock().unwrap();
-        command.take()
-    }
-}
+// -- Основная логика --
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -48,53 +37,60 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    // Создаем директории заранее, если их нет
+    fs::create_dir_all("aware_logs")?;
+    fs::create_dir_all("aware_pids")?;
+
     match args[1].as_str() {
         "supervise" => {
             if args.len() < 3 {
-                println!("Error: Specify a program to run");
+                eprintln!("Ошибка: Укажите программу для запуска."); // Пишем ошибки в stderr
+                print_usage();
                 return Ok(());
             }
 
-            // Create logs directory
-            fs::create_dir_all("aware_logs")?;
+            let program_path_str = &args[2];
+            let program_path = Path::new(program_path_str);
 
-            // Get program name from path
-            let program_path = &args[2];
-            let program_name = Path::new(program_path)
+            // Получаем имя программы из пути
+            let program_name = program_path
                 .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .to_string();
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| program_path_str.to_string()); // Запасной вариант, если имя извлечь не удалось
 
-            // Create log path
-            let log_path = format!("aware_logs/{}.log", program_name);
+            // Пути к лог-файлу и PID-файлу
+            let log_path = PathBuf::from(format!("aware_logs/{}.log", program_name));
+            let pid_path = PathBuf::from(format!("aware_pids/{}.pid", program_name));
 
-            // Prepare process info
+            // Информация о процессе
             let process_info = ProcessInfo {
-                name: program_path.clone(),
+                name: program_path_str.clone(),
+                program_name: program_name.clone(), // Сохраняем чистое имя
                 args: args[3..].to_vec(),
                 log_path,
+                pid_path: pid_path.clone(), // Клонируем для передачи
             };
 
-            // Write PID file
-            write_pid_file(&program_name)?;
+            // Записываем PID-файл (с PID текущего супервизора)
+            // Передаем &pid_path вместо строки
+            write_pid_file(&pid_path, &process_info.program_name)?;
 
-            // Run supervisor
-            run_supervisor(process_info)?;
+            // Запускаем супервизор
+            // Используем expect для критических ошибок
+            run_supervisor(process_info).expect("Не удалось запустить супервизор");
         }
         "leave" => {
-            // Check if specific program name is provided
             if args.len() >= 3 {
-                // Send command to terminate specific program
-                send_leave_command(Some(&args[2]))?;
+                // Остановка конкретной программы
+                send_leave_signal(Some(&args[2]))?;
             } else {
-                // Send command to terminate all programs
-                send_leave_command(None)?;
+                // Остановка всех программ
+                send_leave_signal(None)?;
             }
         }
         _ => {
-            println!("Unknown command: {}", args[1]);
-            println!("Supported commands: supervise, leave");
+            eprintln!("Неизвестная команда: {}", args[1]);
+            eprintln!("Поддерживаемые команды: supervise, leave");
         }
     }
 
@@ -103,134 +99,130 @@ fn main() -> io::Result<()> {
 
 fn print_usage() {
     println!(
-        "Usage:\n  aware supervise <program> [arguments...]\n  aware leave [program_name]"
+        "Использование:\n  aware supervise <программа> [аргументы...]\n  aware leave [имя_программы]"
     );
 }
 
-fn write_pid_file(program_name: &str) -> io::Result<()> {
-    // Create PIDs directory if it doesn't exist
-    fs::create_dir_all("aware_pids")?;
+// -- Управление PID-файлами --
 
-    // Create PID file with program name
-    let pid_file_path = format!("aware_pids/{}.pid", program_name);
-    let mut pid_file = File::create(&pid_file_path)?;
-
-    // Get current process PID
+// Записывает PID текущего процесса (супервизора) в файл
+fn write_pid_file(pid_path: &Path, program_name: &str) -> io::Result<()> {
+    // Записываем PID текущего процесса
     let pid = std::process::id();
-    writeln!(pid_file, "{}", pid)?;
+    fs::write(pid_path, pid.to_string())?; // fs::write проще для записи строки
 
-    // Add entry to the common process list
-    let all_pids_path = "aware_pids/processes.list";
-    let mut all_pids_file = OpenOptions::new()
+    // Добавляем запись в общий список процессов (опционально, но полезно для leave all)
+    let list_path = PathBuf::from("aware_pids/processes.list");
+    let mut list_file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(all_pids_path)?;
-
-    writeln!(all_pids_file, "{}:{}", program_name, pid)?;
+        .open(list_path)?;
+    // Храним путь к pid файлу для простоты поиска при leave all
+    writeln!(list_file, "{}:{}", program_name, pid_path.display())?;
 
     Ok(())
 }
 
-fn send_leave_command(program_name: Option<&str>) -> io::Result<()> {
-    if let Some(name) = program_name {
-        println!("Sending leave command to process {}", name);
-
-        // Form path to the PID file for the specific program
-        let pid_file_path = format!("aware_pids/{}.pid", name);
-
-        // Check if PID file exists
-        if !Path::new(&pid_file_path).exists() {
-            println!(
-                "PID file for {} not found, process may not be running",
-                name
-            );
-            return Ok(());
-        }
-
-        // Read PID from file
-        let mut pid_file = File::open(&pid_file_path)?;
-        let mut pid_str = String::new();
-        pid_file.read_to_string(&mut pid_str)?;
-
-        let pid = pid_str.trim().parse::<u32>().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Error parsing PID: {}", e),
-            )
-        })?;
-
-        println!("Sending signal to process {} with PID: {}", name, pid);
-
-        // In a real implementation, here would be code to send a signal
-        // In this simplified version, we just delete the PID file
-        fs::remove_file(pid_file_path)?;
-        println!("Command sent to process {}", name);
-    } else {
-        println!("Sending leave command to all running aware processes");
-
-        // Check if the directory with PID files exists
-        let pid_dir_path = PathBuf::from("aware_pids");
-        if !pid_dir_path.exists() {
-            println!("PID files directory not found, there may be no active supervisors");
-            return Ok(());
-        }
-
-        // Iterate through all PID files
-        for entry in fs::read_dir(pid_dir_path.clone())? {
-            let entry = entry?;
-            let path = entry.path();
-
-            // Skip the process list file
-            if path.file_name().unwrap() == "processes.list" {
-                continue;
-            }
-
-            // Check if it's a PID file
-            if let Some(extension) = path.extension() {
-                if extension == "pid" {
-                    // Read PID from file
-                    let mut pid_file = File::open(&path)?;
-                    let mut pid_str = String::new();
-                    pid_file.read_to_string(&mut pid_str)?;
-
-                    let pid = match pid_str.trim().parse::<u32>() {
-                        Ok(pid) => pid,
-                        Err(e) => {
-                            println!(
-                                "Error reading PID from {:?}: {}",
-                                path.file_name().unwrap(),
-                                e
-                            );
-                            continue;
-                        }
-                    };
-
-                    // Get program name (without .pid extension)
-                    let file_name = path.file_name().unwrap().to_string_lossy().to_string();
-                    let prog_name = file_name.trim_end_matches(".pid");
-                    println!("Sending signal to process {} with PID: {}", prog_name, pid);
-
-                    // Delete PID file
-                    fs::remove_file(&path)?;
-                }
-            }
-        }
-
-        // Clear the process list file
-        let list_path = pid_dir_path.join("processes.list");
-        File::create(list_path)?;
-
-        println!("Command sent to all processes");
+// Удаляет PID-файл и запись из списка (если нужно)
+fn cleanup_pid_file(pid_path: &Path, program_name: &str) -> io::Result<()> {
+    if pid_path.exists() {
+        fs::remove_file(pid_path)?;
     }
 
+    // Очистка из списка (более сложная, требует чтения и перезаписи)
+    // Для простоты пока можно пропустить или реализовать отдельно
+    // если `leave all` будет опираться только на файлы *.pid
+    let _ = program_name; // Убираем warning о неиспользуемой переменной
+
     Ok(())
 }
 
-fn run_supervisor(info: ProcessInfo) -> io::Result<()> {
-    println!("Starting supervisor for program: {}", info.name);
-    println!("Logs will be saved to: {}", info.log_path);
+// -- Отправка сигнала для остановки --
 
-    // Open file for logs
+fn send_leave_signal(program_name: Option<&str>) -> io::Result<()> {
+    let pids_to_signal: Vec<(String, u32)> = Vec::new(); // Собираем PIDы для отправки сигналов
+
+    if let Some(name) = program_name {
+        // Сигнал конкретному процессу
+        println!("Отправка команды leave процессу {}", name);
+        let pid_path = PathBuf::from(format!("aware_pids/{}.pid", name));
+        match read_pid_from_file(&pid_path) {
+            Ok(pid) => {
+                println!("Отправка SIGTERM процессу {} (PID: {})", name, pid);
+                // Отправляем сигнал SIGTERM
+                match kill(Pid::from_raw(pid as i32), Some(Signal::SIGTERM)) {
+                    Ok(_) => println!("Сигнал отправлен успешно."),
+                    Err(e) => eprintln!("Ошибка отправки сигнала процессу {}: {}", pid, e),
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "Не удалось прочитать PID для {}: {}. Процесс не запущен или PID-файл поврежден.",
+                    name, e
+                );
+            }
+        }
+    } else {
+        // Сигнал всем процессам
+        println!("Отправка команды leave всем запущенным aware процессам");
+        let pid_dir_path = PathBuf::from("aware_pids");
+        if !pid_dir_path.exists() {
+            println!("Директория PID-файлов не найдена.");
+            return Ok(());
+        }
+
+        // Итерируемся по *.pid файлам
+        match fs::read_dir(pid_dir_path) {
+            Ok(entries) => {
+                 for entry_result in entries {
+                     if let Ok(entry) = entry_result {
+                         let path = entry.path();
+                         if path.is_file() && path.extension().map_or(false, |ext| ext == "pid") {
+                             let name = path.file_stem().map_or_else(
+                                || "unknown".to_string(), // Вряд ли случится
+                                |stem| stem.to_string_lossy().into_owned()
+                             );
+                             match read_pid_from_file(&path) {
+                                 Ok(pid) => {
+                                     println!("Отправка SIGTERM процессу {} (PID: {})", name, pid);
+                                     match kill(Pid::from_raw(pid as i32), Some(Signal::SIGTERM)) {
+                                         Ok(_) => {} // Успешно
+                                         Err(e) => eprintln!("Ошибка отправки сигнала процессу {}: {}", pid, e),
+                                     }
+                                 }
+                                 Err(e) => {
+                                     eprintln!("Не удалось прочитать PID для {}: {}", name, e);
+                                 }
+                             }
+                         }
+                     }
+                 }
+                 println!("Команда leave отправлена всем найденным процессам.");
+            },
+            Err(e) => eprintln!("Не удалось прочитать директорию PID-файлов: {}", e),
+        }
+    }
+    Ok(())
+}
+
+fn read_pid_from_file(pid_path: &Path) -> io::Result<u32> {
+    let pid_str = fs::read_to_string(pid_path)?;
+    pid_str
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Ошибка парсинга PID: {}", e)))
+}
+
+// -- Основной цикл супервизора --
+
+fn run_supervisor(info: ProcessInfo) -> io::Result<()> {
+    println!(
+        "Запуск супервизора для программы: {}",
+        info.program_name
+    );
+    println!("Логи будут сохраняться в: {}", info.log_path.display());
+
+    // Открываем файл логов с мьютексом для потокобезопасной записи
     let log_file = Arc::new(Mutex::new(
         OpenOptions::new()
             .create(true)
@@ -238,155 +230,186 @@ fn run_supervisor(info: ProcessInfo) -> io::Result<()> {
             .open(&info.log_path)?,
     ));
 
-    write_log(&log_file, "Starting supervisor")?;
+    write_log(&log_file, "Запуск супервизора")?;
 
-    // Create channel for commands
-    let command_channel = Arc::new(CommandChannel::new());
-    let running = Arc::new(AtomicBool::new(true));
+    // Устанавливаем обработчик сигнала SIGTERM
+    let term_signal = Arc::new(AtomicBool::new(false));
+    // Регистрируем обработчик. Используем expect, так как ошибка здесь критична.
+    signal_flag::register(SIGTERM, Arc::clone(&term_signal))
+        .expect("Не удалось зарегистрировать обработчик сигнала SIGTERM");
 
-    // Start thread for command processing
-    let command_thread_running = Arc::clone(&running);
-    let command_thread_channel = Arc::clone(&command_channel);
-    let command_thread = thread::spawn(move || {
-        command_listener(command_thread_running, command_thread_channel);
-    });
+    let mut child_handle: Option<Child> = None;
+    let mut stdout_handle: Option<JoinHandle<()>> = None;
+    let mut stderr_handle: Option<JoinHandle<()>> = None;
 
-    let running_clone = Arc::clone(&running);
-    while running.load(Ordering::Acquire) {
-        // Start process
-        let mut child = match start_process(&info, &log_file) {
-            Ok(child) => child,
-            Err(e) => {
-                let err_msg = format!("Error starting process: {}", e);
-                let _ = write_log(&log_file, &err_msg);
-
-                // Pause before retry
-                thread::sleep(Duration::from_secs(5));
-                continue;
+    // Основной цикл супервизора
+    loop {
+        // Проверяем, не пришел ли сигнал завершения
+        if term_signal.load(Ordering::Relaxed) {
+            write_log(&log_file, "Получен сигнал SIGTERM, начинаем завершение...")?;
+            if let Some(mut child) = child_handle.take() {
+                 write_log(&log_file, "Отправка SIGTERM дочернему процессу...")?;
+                 match child.kill() { // Посылаем SIGKILL (или можно SIGTERM сначала, потом SIGKILL)
+                     Ok(_) => {
+                         write_log(&log_file, "Ожидание завершения дочернего процесса...")?;
+                         match child.wait() {
+                            Ok(status) => write_log(&log_file, &format!("Дочерний процесс завершен со статусом: {}", status))?,
+                            Err(e) => write_log(&log_file, &format!("Ошибка ожидания дочернего процесса: {}", e))?,
+                         }
+                     },
+                     Err(e) => write_log(&log_file, &format!("Ошибка отправки сигнала kill дочернему процессу: {}", e))?,
+                 }
             }
-        };
+            break; // Выходим из основного цикла
+        }
 
-        // Wait for process to finish or command to stop
-        loop {
-            // Check process status
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    // Process finished
-                    let exit_msg = if status.success() {
-                        "Process finished successfully with code 0".to_string()
-                    } else {
-                        format!(
-                            "Process finished with error: code {}",
-                            status.code().unwrap_or(-1)
-                        )
-                    };
-                    let _ = write_log(&log_file, &exit_msg);
-                    break;
-                }
-                Ok(None) => {
-                    // Process still running, check commands
-                    if !running.load(Ordering::Acquire) {
-                        let _ = write_log(&log_file, "Received command to terminate");
-                        let _ = child.kill();
-                        let _ = write_log(&log_file, "Process stopped");
-                        return Ok(());
-                    }
-
-                    // Small pause to avoid CPU overload
-                    thread::sleep(Duration::from_millis(100));
+        // Запускаем процесс, если он еще не запущен или упал
+        if child_handle.is_none() {
+            match start_process(&info, &log_file) {
+                Ok((child, h_out, h_err)) => {
+                    child_handle = Some(child);
+                    stdout_handle = Some(h_out);
+                    stderr_handle = Some(h_err);
                 }
                 Err(e) => {
-                    let err_msg = format!("Error checking process status: {}", e);
-                    let _ = write_log(&log_file, &err_msg);
-                    break;
+                    write_log(&log_file, &format!("Ошибка запуска процесса: {}. Повтор через 5 сек...", e))?;
+                    thread::sleep(Duration::from_secs(5));
+                    continue; // Переходим к следующей итерации для повторного запуска
+                }
+            };
+        }
+
+        // Проверяем состояние дочернего процесса
+        if let Some(mut child) = child_handle.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // Процесс завершился
+                    write_log(
+                        &log_file,
+                        &format!("Процесс завершился со статусом: {}", status),
+                    )?;
+                    child_handle = None; // Сбрасываем хэндл, чтобы перезапустить на след. итерации
+
+                    // Ждем завершения потоков логирования
+                    if let Some(h) = stdout_handle.take() { h.join().expect("Поток stdout паниковал"); }
+                    if let Some(h) = stderr_handle.take() { h.join().expect("Поток stderr паниковал"); }
+
+                    // Пауза перед перезапуском (если не было сигнала)
+                     if !term_signal.load(Ordering::Relaxed) {
+                         write_log(&log_file, "Перезапуск через 2 секунды...")?;
+                         thread::sleep(Duration::from_secs(2));
+                     }
+                }
+                Ok(None) => {
+                    // Процесс еще работает, ничего не делаем, короткая пауза
+                    thread::sleep(Duration::from_millis(200));
+                }
+                Err(e) => {
+                    // Ошибка при проверке статуса
+                    write_log(
+                        &log_file,
+                        &format!("Ошибка проверки статуса процесса: {}. Перезапуск...", e),
+                    )?;
+                    child_handle = None; // Сбрасываем для перезапуска
+
+                     // Завершаем потоки логирования при ошибке
+                     if let Some(h) = stdout_handle.take() { h.join().expect("Поток stdout паниковал"); }
+                     if let Some(h) = stderr_handle.take() { h.join().expect("Поток stderr паниковал"); }
+
+                     thread::sleep(Duration::from_secs(2)); // Пауза перед перезапуском
                 }
             }
         }
+    } // Конец основного цикла loop
 
-        // Pause before restarting the process
-        if running.load(Ordering::Acquire) {
-            let _ = write_log(&log_file, "Restarting process in 2 seconds...");
-            thread::sleep(Duration::from_secs(2));
-        }
-    }
+    write_log(&log_file, "Супервизор завершает работу.")?;
 
-    let _ = write_log(&log_file, "Supervisor shutting down");
-
-    // Wait for command thread to finish
-    running_clone.store(false, Ordering::Release);
-    let _ = command_thread.join();
+    // Очистка PID-файла при завершении
+    cleanup_pid_file(&info.pid_path, &info.program_name)
+        .map_err(|e| eprintln!("Ошибка при очистке PID-файла: {}", e))
+        .ok(); // Игнорируем ошибку очистки, если она произошла
 
     Ok(())
 }
 
+
+// -- Запуск дочернего процесса и логирование его вывода --
+
 fn start_process(
     info: &ProcessInfo,
-    log_file: &Arc<Mutex<File>>,
-) -> io::Result<Child> {
-    // Form startup message
+    log_file_arc: &Arc<Mutex<File>>,
+) -> io::Result<(Child, JoinHandle<()>, JoinHandle<()>)> { // Возвращаем хендлы потоков логов
     let args_str = info.args.join(" ");
-    let start_msg = format!("Starting process: {} {}", info.name, args_str);
-    write_log(log_file, &start_msg)?;
+    write_log(log_file_arc,&format!("Запуск процесса: {} {}", info.name, args_str))?;
 
-    // Start process
     let mut command = Command::new(&info.name);
     if !info.args.is_empty() {
         command.args(&info.args);
     }
-    
-    // Configure standard streams
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
 
-    let child = command.spawn()?;
+    // Перенаправляем stdout и stderr
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
 
-    let pid_msg = format!("Process started, PID: {}", child.id());
-    write_log(log_file, &pid_msg)?;
+    let mut child = command.spawn()?; // Используем mut child
 
-    Ok(child)
+    let pid_msg = format!("Процесс запущен, PID: {}", child.id());
+    write_log(log_file_arc, &pid_msg)?;
+
+    // --- Запуск потоков логирования ---
+
+    // stdout
+    let stdout = child.stdout.take()
+        .expect("Не удалось получить stdout дочернего процесса"); // Критическая ошибка
+    let log_stdout = Arc::clone(log_file_arc);
+    let stdout_handle = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line_result in reader.lines() {
+            match line_result {
+                // Пишем в лог с префиксом [stdout]
+                Ok(line) => { let _ = write_log(&log_stdout, &format!("[stdout] {}", line)); },
+                Err(e) => { let _ = write_log(&log_stdout, &format!("[stdout error] Ошибка чтения: {}", e)); break; }
+            }
+        }
+        // Можно добавить лог о завершении потока
+        let _ = write_log(&log_stdout, "[stdout thread finished]");
+    });
+
+    // stderr
+    let stderr = child.stderr.take()
+        .expect("Не удалось получить stderr дочернего процесса"); // Критическая ошибка
+    let log_stderr = Arc::clone(log_file_arc);
+    let stderr_handle = thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line_result in reader.lines() {
+             match line_result {
+                // Пишем в лог с префиксом [stderr]
+                Ok(line) => { let _ = write_log(&log_stderr, &format!("[stderr] {}", line)); },
+                Err(e) => { let _ = write_log(&log_stderr, &format!("[stderr error] Ошибка чтения: {}", e)); break; }
+            }
+        }
+         // Можно добавить лог о завершении потока
+        let _ = write_log(&log_stderr, "[stderr thread finished]");
+    });
+
+    Ok((child, stdout_handle, stderr_handle))
 }
 
-fn write_log(file: &Arc<Mutex<File>>, message: &str) -> io::Result<()> {
-    // Get current time
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_secs();
 
-    // Format timestamp (simplified version)
-    let hours = (now % 86400) / 3600;
-    let minutes = (now % 3600) / 60;
-    let seconds = now % 60;
+// -- Утилита логирования --
 
-    // Create log message
-    let log_message = format!(
-        "[2023-10-15 {:02}:{:02}:{:02}] {}\n",
-        hours, minutes, seconds, message
-    );
+fn write_log(log_file_arc: &Arc<Mutex<File>>, message: &str) -> io::Result<()> {
+    // Используем chrono для форматирования времени
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+    let log_message = format!("[{}] {}\n", timestamp, message);
 
-    // Write to file
-    let mut file_guard = file.lock().unwrap();
+    // Запись в файл
+    // Используем expect, так как отравленный мьютекс здесь критичен
+    let mut file_guard = log_file_arc.lock().expect("Мьютекс лог-файла отравлен!");
     file_guard.write_all(log_message.as_bytes())?;
-    
-    // Also print to console
+
+    // Также выводим в консоль супервизора
     print!("{}", log_message);
 
     Ok(())
-}
-
-fn command_listener(running: Arc<AtomicBool>, command_channel: Arc<CommandChannel>) {
-    while running.load(Ordering::Acquire) {
-        // Check for commands in the channel
-        if let Some(cmd) = command_channel.get_command() {
-            match cmd {
-                SupervisorCommand::Leave => {
-                    running.store(false, Ordering::Release);
-                    break;
-                }
-            }
-        }
-
-        // Pause between checks
-        thread::sleep(Duration::from_millis(100));
-    }
 }
