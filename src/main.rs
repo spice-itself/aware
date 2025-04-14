@@ -1,12 +1,10 @@
 use chrono::Local;
-// Импорты nix теперь должны работать с включенными features
 use nix::{
     sys::signal::{kill, Signal},
     unistd::Pid,
 };
 use signal_hook::{consts::SIGTERM, flag as signal_flag};
 use std::{
-    // Добавляем env обратно, так как main будет восстановлена
     env,
     fs::{self, File, OpenOptions},
     // Убираем неиспользуемый Read
@@ -21,7 +19,6 @@ use std::{
     time::Duration,
 };
 
-// --- ВОССТАНАВЛИВАЕМ ОПРЕДЕЛЕНИЕ ProcessInfo ---
 struct ProcessInfo {
     name: String,          // Полный путь или имя программы
     program_name: String,  // Имя файла программы (для имен файлов)
@@ -29,9 +26,7 @@ struct ProcessInfo {
     log_path: PathBuf,     // Используем PathBuf для путей
     pid_path: PathBuf,
 }
-// -----------------------------------------------
 
-// --- ВОССТАНАВЛИВАЕМ main ---
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
 
@@ -99,15 +94,12 @@ fn main() -> io::Result<()> {
 
     Ok(())
 }
-// -----------------------------
 
-// --- ВОССТАНАВЛИВАЕМ print_usage ---
 fn print_usage() {
     println!(
         "Использование:\n  aware supervise <программа> [аргументы...]\n  aware leave [имя_программы]"
     );
 }
-// ------------------------------------
 
 // -- Управление PID-файлами --
 
@@ -129,7 +121,6 @@ fn write_pid_file(pid_path: &Path, program_name: &str) -> io::Result<()> {
     Ok(())
 }
 
-// --- ВОССТАНАВЛИВАЕМ cleanup_pid_file ---
 // Удаляет PID-файл и запись из списка (если нужно)
 fn cleanup_pid_file(pid_path: &Path, program_name: &str) -> io::Result<()> {
     if pid_path.exists() {
@@ -143,14 +134,12 @@ fn cleanup_pid_file(pid_path: &Path, program_name: &str) -> io::Result<()> {
 
     Ok(())
 }
-// ----------------------------------------
 
 // -- Отправка сигнала для остановки --
 
 fn send_leave_signal(program_name: Option<&str>) -> io::Result<()> {
-    // --- УДАЛЯЕМ НЕИСПОЛЬЗУЕМУЮ ПЕРЕМЕННУЮ ---
+
     // let pids_to_signal: Vec<(String, u32)> = Vec::new();
-    // ----------------------------------------
 
     if let Some(name) = program_name {
         // Сигнал конкретному процессу
@@ -215,7 +204,6 @@ fn send_leave_signal(program_name: Option<&str>) -> io::Result<()> {
     Ok(())
 }
 
-// --- ВОССТАНАВЛИВАЕМ read_pid_from_file ---
 fn read_pid_from_file(pid_path: &Path) -> io::Result<u32> {
     let pid_str = fs::read_to_string(pid_path)?;
     pid_str
@@ -223,7 +211,6 @@ fn read_pid_from_file(pid_path: &Path) -> io::Result<u32> {
         .parse::<u32>()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Ошибка парсинга PID: {}", e)))
 }
-// ----------------------------------------
 
 // -- Основной цикл супервизора --
 
@@ -296,7 +283,6 @@ fn run_supervisor(info: ProcessInfo) -> io::Result<()> {
         }
 
         // Проверяем состояние дочернего процесса
-        // Убираем 'mut' из 'mut child', так как child.try_wait() не требует &mut self
         if let Some(child) = child_handle.as_mut() {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -342,7 +328,6 @@ fn run_supervisor(info: ProcessInfo) -> io::Result<()> {
     write_log(&log_file, "Супервизор завершает работу.")?;
 
     // Очистка PID-файла при завершении
-    // --- Используем cleanup_pid_file ---
     cleanup_pid_file(&info.pid_path, &info.program_name)
         .map_err(|e| eprintln!("Ошибка при очистке PID-файла: {}", e))
         .ok(); // Игнорируем ошибку очистки, если она произошла
@@ -350,9 +335,6 @@ fn run_supervisor(info: ProcessInfo) -> io::Result<()> {
     Ok(())
 }
 
-// -- Запуск дочернего процесса и логирование его вывода --
-
-// --- Используем &ProcessInfo ---
 fn start_process(
     info: &ProcessInfo,
     log_file_arc: &Arc<Mutex<File>>,
